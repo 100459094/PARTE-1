@@ -618,3 +618,75 @@ class client:
         finally:
             # Close connection
             conn.close()
+
+if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-s', '--server', required=True, help='Server IP address')
+    parser.add_argument('-p', '--port', required=True, type=int, help='Server port')
+    args = parser.parse_args()
+
+    # Set server address and port
+    client._server = args.server
+    client._port = args.port
+
+    print("Cliente iniciado. Conectado a {}:{}".format(args.server, args.port))
+    print("Comandos disponibles:")
+    print("  REGISTER <username>")
+    print("  UNREGISTER <username>")
+    print("  CONNECT <username>")
+    print("  DISCONNECT <username>")
+    print("  PUBLISH <filename> <description>")
+    print("  DELETE <filename>")
+    print("  LIST USERS")
+    print("  LIST CONTENT <username>")
+    print("  GET FILE <username> <remote_file> <local_file>")
+    print("  QUIT")
+
+    # Main loop
+    while True:
+        try:
+            command = input(">> ")
+            parts = command.split()
+
+            if not parts:
+                continue
+
+            if parts[0] == "REGISTER" and len(parts) == 2:
+                client.register(parts[1])
+            elif parts[0] == "UNREGISTER" and len(parts) == 2:
+                client.unregister(parts[1])
+            elif parts[0] == "CONNECT" and len(parts) == 2:
+                client.connect(parts[1])
+            elif parts[0] == "DISCONNECT" and len(parts) == 2:
+                client.disconnect(parts[1])
+            elif parts[0] == "PUBLISH" and len(parts) >= 3:
+                filename = parts[1]
+                description = " ".join(parts[2:])
+                client.publish(filename, description)
+            elif parts[0] == "DELETE" and len(parts) == 2:
+                client.delete(parts[1])
+            elif parts[0] == "LIST":
+                if len(parts) == 2 and parts[1] == "USERS":
+                    client.listusers()
+                elif len(parts) == 3 and parts[1] == "CONTENT":
+                    client.listcontent(parts[2])
+                else:
+                    print("Comando LIST inválido")
+            elif parts[0] == "GET" and parts[1] == "FILE" and len(parts) == 5:
+                client.getfile(parts[2], parts[3], parts[4])
+            elif parts[0] == "QUIT":
+                if client._connected_user:
+                    client.disconnect(client._connected_user)
+                break
+            else:
+                print("Comando no reconocido")
+
+        except KeyboardInterrupt:
+            if client._connected_user:
+                client.disconnect(client._connected_user)
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+
+    print("Cliente terminado")

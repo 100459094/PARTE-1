@@ -8,17 +8,34 @@
 #include <arpa/inet.h>
 #include <signal.h>
 
+// Definiciones según el PDF
 #define MAX_FILENAME 256
 #define MAX_DESCRIPTION 256
+#define MAX_USERNAME 256
 #define BUFFER_SIZE 1024
+#define BACKLOG 10
 
-// Estructura para almacenar información de usuarios
+// Códigos de respuesta según el PDF
+#define RC_OK 0
+#define RC_USER_EXISTS 1
+#define RC_ERROR 2
+#define RC_USER_NOT_CONNECTED 2
+#define RC_ALREADY_CONNECTED 2
+#define RC_CONTENT_EXISTS 3
+#define RC_REMOTE_USER_NOT_EXISTS 3
+#define RC_OTHER_ERROR 4
+
 typedef struct {
-    char username[256];
+    char filename[MAX_FILENAME];
+    char description[MAX_DESCRIPTION];
+} file_info;
+
+typedef struct {
+    char username[MAX_USERNAME];
     char ip[16];
     int port;
     int connected;
-    char **files;
+    file_info *files;
     int num_files;
     pthread_mutex_t lock;
 } user_info;
@@ -27,19 +44,21 @@ typedef struct {
 user_info *users = NULL;
 int num_users = 0;
 pthread_mutex_t users_lock = PTHREAD_MUTEX_INITIALIZER;
-int server_running = 1;
+volatile sig_atomic_t server_running = 1;
 
-// Funciones auxiliares
+// Prototipos de funciones
 void *handle_client(void *socket_desc);
 int find_user(const char *username);
 void add_user(const char *username);
 void remove_user(const char *username);
-void add_file(int user_index, const char *filename);
+void add_file(int user_index, const char *filename, const char *description);
 void remove_file(int user_index, const char *filename);
 char* read_string(int socket);
+int send_string(int socket, const char *str);
+void handle_signal(int sig);
 
-// Manejador de señal para terminar el servidor
 void handle_signal(int sig) {
+    printf("\ns> Servidor terminando...\n");
     server_running = 0;
 }
 
@@ -57,13 +76,25 @@ int main(int argc, char *argv[]) {
     }
     port = atoi(argv[2]);
 
-    // Configurar manejador de señal
-    signal(SIGINT, handle_signal);
+    // Configurar manejador de señal mejorado
+    struct sigaction sa;
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
 
     // Crear socket del servidor
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         perror("Error creando socket");
+        exit(1);
+    }
+
+    // Permitir reutilización del puerto
+    int opt = 1;
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("Error en setsockopt");
+        close(server_socket);
         exit(1);
     }
 
@@ -73,23 +104,25 @@ int main(int argc, char *argv[]) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    // Obtener IP local
-    struct sockaddr_in local_addr;
-    socklen_t len = sizeof(local_addr);
-    getsockname(server_socket, (struct sockaddr *)&local_addr, &len);
-    inet_ntop(AF_INET, &local_addr.sin_addr, local_ip, sizeof(local_ip));
-
     // Bind
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Error en bind");
+        close(server_socket);
         exit(1);
     }
 
     // Listen
-    if (listen(server_socket, 10) < 0) {
+    if (listen(server_socket, BACKLOG) < 0) {
         perror("Error en listen");
+        close(server_socket);
         exit(1);
     }
+
+    // Obtener IP local
+    struct sockaddr_in local_addr;
+    socklen_t len = sizeof(local_addr);
+    getsockname(server_socket, (struct sockaddr*)&local_addr, &len);
+    inet_ntop(AF_INET, &(local_addr.sin_addr), local_ip, sizeof(local_ip));
 
     printf("s> init server %s:%d\n", local_ip, port);
     printf("s>\n");
@@ -99,6 +132,10 @@ int main(int argc, char *argv[]) {
         client_len = sizeof(client_addr);
         client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
         
+        if (!server_running) {
+            break;
+        }
+
         if (client_socket < 0) {
             if (server_running) {
                 perror("Error en accept");
@@ -106,11 +143,9 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Crear estructura para pasar al hilo
         int *new_sock = malloc(sizeof(int));
         *new_sock = client_socket;
 
-        // Crear nuevo hilo para manejar la conexión
         if (pthread_create(&thread_id, NULL, handle_client, (void*)new_sock) < 0) {
             perror("Error creando hilo");
             close(client_socket);
@@ -120,13 +155,12 @@ int main(int argc, char *argv[]) {
         pthread_detach(thread_id);
     }
 
-    // Liberar recursos
+    // Limpieza final
     close(server_socket);
+    
+    // Liberar memoria y recursos
     for (int i = 0; i < num_users; i++) {
         pthread_mutex_destroy(&users[i].lock);
-        for (int j = 0; j < users[i].num_files; j++) {
-            free(users[i].files[j]);
-        }
         free(users[i].files);
     }
     free(users);
@@ -138,8 +172,8 @@ int main(int argc, char *argv[]) {
 void *handle_client(void *socket_desc) {
     int sock = *(int*)socket_desc;
     free(socket_desc);
-    char *operation = read_string(sock);
     
+    char *operation = read_string(sock);
     if (!operation) {
         close(sock);
         return NULL;
@@ -157,13 +191,11 @@ void *handle_client(void *socket_desc) {
     if (strcmp(operation, "REGISTER") == 0) {
         pthread_mutex_lock(&users_lock);
         if (find_user(username) >= 0) {
-            // Usuario ya existe
-            char response = 1;
+            char response = RC_USER_EXISTS;
             send(sock, &response, 1, 0);
         } else {
-            // Registrar nuevo usuario
             add_user(username);
-            char response = 0;
+            char response = RC_OK;
             send(sock, &response, 1, 0);
         }
         pthread_mutex_unlock(&users_lock);
@@ -172,13 +204,11 @@ void *handle_client(void *socket_desc) {
         pthread_mutex_lock(&users_lock);
         int user_index = find_user(username);
         if (user_index < 0) {
-            // Usuario no existe
-            char response = 1;
+            char response = RC_ERROR;
             send(sock, &response, 1, 0);
         } else {
-            // Eliminar usuario
             remove_user(username);
-            char response = 0;
+            char response = RC_OK;
             send(sock, &response, 1, 0);
         }
         pthread_mutex_unlock(&users_lock);
@@ -196,30 +226,213 @@ void *handle_client(void *socket_desc) {
         int user_index = find_user(username);
         
         if (user_index < 0) {
-            // Usuario no existe
-            char response = 1;
+            char response = RC_ERROR;
             send(sock, &response, 1, 0);
         }
         else if (users[user_index].connected) {
-            // Usuario ya conectado
-            char response = 2;
+            char response = RC_ALREADY_CONNECTED;
             send(sock, &response, 1, 0);
         }
         else {
-            // Conectar usuario
             struct sockaddr_in addr;
             socklen_t len = sizeof(addr);
             getpeername(sock, (struct sockaddr*)&addr, &len);
             strcpy(users[user_index].ip, inet_ntoa(addr.sin_addr));
             users[user_index].port = atoi(port_str);
             users[user_index].connected = 1;
-            char response = 0;
+            char response = RC_OK;
             send(sock, &response, 1, 0);
         }
         pthread_mutex_unlock(&users_lock);
         free(port_str);
     }
-    // Implementar resto de operaciones...
+    else if (strcmp(operation, "DISCONNECT") == 0) {
+        pthread_mutex_lock(&users_lock);
+        int user_index = find_user(username);
+        
+        if (user_index < 0) {
+            char response = RC_ERROR;
+            send(sock, &response, 1, 0);
+        }
+        else if (!users[user_index].connected) {
+            char response = RC_USER_NOT_CONNECTED;
+            send(sock, &response, 1, 0);
+        }
+        else {
+            users[user_index].connected = 0;
+            char response = RC_OK;
+            send(sock, &response, 1, 0);
+        }
+        pthread_mutex_unlock(&users_lock);
+    }
+    else if (strcmp(operation, "PUBLISH") == 0) {
+        char *filename = read_string(sock);
+        char *description = read_string(sock);
+        
+        if (!filename || !description) {
+            free(filename);
+            free(description);
+            close(sock);
+            return NULL;
+        }
+
+        pthread_mutex_lock(&users_lock);
+        int user_index = find_user(username);
+        
+        if (user_index < 0) {
+            char response = RC_ERROR;
+            send(sock, &response, 1, 0);
+        }
+        else if (!users[user_index].connected) {
+            char response = RC_USER_NOT_CONNECTED;
+            send(sock, &response, 1, 0);
+        }
+        else {
+            pthread_mutex_lock(&users[user_index].lock);
+            int file_exists = 0;
+            for (int i = 0; i < users[user_index].num_files; i++) {
+                if (strcmp(users[user_index].files[i].filename, filename) == 0) {
+                    file_exists = 1;
+                    break;
+                }
+            }
+            
+            if (file_exists) {
+                char response = RC_CONTENT_EXISTS;
+                send(sock, &response, 1, 0);
+            } else {
+                add_file(user_index, filename, description);
+                char response = RC_OK;
+                send(sock, &response, 1, 0);
+            }
+            pthread_mutex_unlock(&users[user_index].lock);
+        }
+        pthread_mutex_unlock(&users_lock);
+        
+        free(filename);
+        free(description);
+    }
+    else if (strcmp(operation, "DELETE") == 0) {
+        char *filename = read_string(sock);
+        if (!filename) {
+            close(sock);
+            return NULL;
+        }
+
+        pthread_mutex_lock(&users_lock);
+        int user_index = find_user(username);
+        
+        if (user_index < 0) {
+            char response = RC_ERROR;
+            send(sock, &response, 1, 0);
+        }
+        else if (!users[user_index].connected) {
+            char response = RC_USER_NOT_CONNECTED;
+            send(sock, &response, 1, 0);
+        }
+        else {
+            pthread_mutex_lock(&users[user_index].lock);
+            int file_found = 0;
+            
+            for (int i = 0; i < users[user_index].num_files; i++) {
+                if (strcmp(users[user_index].files[i].filename, filename) == 0) {
+                    file_found = 1;
+                    remove_file(user_index, filename);
+                    break;
+                }
+            }
+            
+            if (file_found) {
+                char response = RC_OK;
+                send(sock, &response, 1, 0);
+            } else {
+                char response = RC_ERROR;
+                send(sock, &response, 1, 0);
+            }
+            
+            pthread_mutex_unlock(&users[user_index].lock);
+        }
+        pthread_mutex_unlock(&users_lock);
+        free(filename);
+    }
+    else if (strcmp(operation, "LIST USERS") == 0) {
+        pthread_mutex_lock(&users_lock);
+        int user_index = find_user(username);
+        
+        if (user_index < 0) {
+            char response = RC_ERROR;
+            send(sock, &response, 1, 0);
+        }
+        else if (!users[user_index].connected) {
+            char response = RC_USER_NOT_CONNECTED;
+            send(sock, &response, 1, 0);
+        }
+        else {
+            char response = RC_OK;
+            send(sock, &response, 1, 0);
+            
+            int connected_users = 0;
+            for (int i = 0; i < num_users; i++) {
+                if (users[i].connected) connected_users++;
+            }
+            
+            char num_str[16];
+            sprintf(num_str, "%d", connected_users);
+            send_string(sock, num_str);
+            
+            for (int i = 0; i < num_users; i++) {
+                if (users[i].connected) {
+                    send_string(sock, users[i].username);
+                    send_string(sock, users[i].ip);
+                    sprintf(num_str, "%d", users[i].port);
+                    send_string(sock, num_str);
+                }
+            }
+        }
+        pthread_mutex_unlock(&users_lock);
+    }
+    else if (strcmp(operation, "LIST CONTENT") == 0) {
+        char *target_username = read_string(sock);
+        if (!target_username) {
+            close(sock);
+            return NULL;
+        }
+
+        pthread_mutex_lock(&users_lock);
+        int user_index = find_user(username);
+        int target_index = find_user(target_username);
+        
+        if (user_index < 0) {
+            char response = RC_ERROR;
+            send(sock, &response, 1, 0);
+        }
+        else if (!users[user_index].connected) {
+            char response = RC_USER_NOT_CONNECTED;
+            send(sock, &response, 1, 0);
+        }
+        else if (target_index < 0) {
+            char response = RC_REMOTE_USER_NOT_EXISTS;
+            send(sock, &response, 1, 0);
+        }
+        else {
+            char response = RC_OK;
+            send(sock, &response, 1, 0);
+            
+            pthread_mutex_lock(&users[target_index].lock);
+            
+            char num_str[16];
+            sprintf(num_str, "%d", users[target_index].num_files);
+            send_string(sock, num_str);
+            
+            for (int i = 0; i < users[target_index].num_files; i++) {
+                send_string(sock, users[target_index].files[i].filename);
+            }
+            
+            pthread_mutex_unlock(&users[target_index].lock);
+        }
+        pthread_mutex_unlock(&users_lock);
+        free(target_username);
+    }
 
     free(operation);
     free(username);
@@ -242,6 +455,10 @@ char* read_string(int socket) {
     }
     buffer[i] = '\0';
     return buffer;
+}
+
+int send_string(int socket, const char *str) {
+    return send(socket, str, strlen(str) + 1, 0);
 }
 
 int find_user(const char *username) {
@@ -269,7 +486,7 @@ void remove_user(const char *username) {
 
     pthread_mutex_destroy(&users[index].lock);
     for (int i = 0; i < users[index].num_files; i++) {
-        free(users[index].files[i]);
+        free(&users[index].files[i]);
     }
     free(users[index].files);
 
@@ -280,23 +497,23 @@ void remove_user(const char *username) {
     users = realloc(users, num_users * sizeof(user_info));
 }
 
-void add_file(int user_index, const char *filename) {
+void add_file(int user_index, const char *filename, const char *description) {
     user_info *user = &users[user_index];
-    user->files = realloc(user->files, (user->num_files + 1) * sizeof(char*));
-    user->files[user->num_files] = strdup(filename);
+    user->files = realloc(user->files, (user->num_files + 1) * sizeof(file_info));
+    strcpy(user->files[user->num_files].filename, filename);
+    strcpy(user->files[user->num_files].description, description);
     user->num_files++;
 }
 
 void remove_file(int user_index, const char *filename) {
     user_info *user = &users[user_index];
     for (int i = 0; i < user->num_files; i++) {
-        if (strcmp(user->files[i], filename) == 0) {
-            free(user->files[i]);
+        if (strcmp(user->files[i].filename, filename) == 0) {
             for (int j = i; j < user->num_files - 1; j++) {
                 user->files[j] = user->files[j + 1];
             }
             user->num_files--;
-            user->files = realloc(user->files, user->num_files * sizeof(char*));
+            user->files = realloc(user->files, user->num_files * sizeof(file_info));
             break;
         }
     }
